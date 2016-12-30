@@ -105,8 +105,9 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
 
     newGauge("NetworkProcessorAvgIdlePercent",
       new Gauge[Double] {
-        def value = allMetricNames.map( metricName =>
-          metrics.metrics().get(metricName).value()).sum / totalProcessorThreads
+        def value = allMetricNames.map { metricName =>
+          Option(metrics.metric(metricName)).fold(0.0)(_.value)
+        }.sum / totalProcessorThreads
       }
     )
 
@@ -165,10 +166,15 @@ class SocketServer(val config: KafkaConfig, val metrics: Metrics, val time: Time
 private[kafka] abstract class AbstractServerThread(connectionQuotas: ConnectionQuotas) extends Runnable with Logging {
 
   private val startupLatch = new CountDownLatch(1)
-  private val shutdownLatch = new CountDownLatch(1)
+
+  // `shutdown()` is invoked before `startupComplete` and `shutdownComplete` if an exception is thrown in the constructor
+  // (e.g. if the address is already in use). We want `shutdown` to proceed in such cases, so we first assign an open
+  // latch and then replace it in `startupComplete()`.
+  @volatile private var shutdownLatch = new CountDownLatch(0)
+
   private val alive = new AtomicBoolean(true)
 
-  def wakeup()
+  def wakeup(): Unit
 
   /**
    * Initiates a graceful shutdown by signaling to stop and waiting for the shutdown to complete
@@ -187,24 +193,26 @@ private[kafka] abstract class AbstractServerThread(connectionQuotas: ConnectionQ
   /**
    * Record that the thread startup is complete
    */
-  protected def startupComplete() = {
+  protected def startupComplete(): Unit = {
+    // Replace the open latch with a closed one
+    shutdownLatch = new CountDownLatch(1)
     startupLatch.countDown()
   }
 
   /**
    * Record that the thread shutdown is complete
    */
-  protected def shutdownComplete() = shutdownLatch.countDown()
+  protected def shutdownComplete(): Unit = shutdownLatch.countDown()
 
   /**
    * Is the server still running?
    */
-  protected def isRunning = alive.get
+  protected def isRunning: Boolean = alive.get
 
   /**
    * Close the connection identified by `connectionId` and decrement the connection count.
    */
-  def close(selector: KSelector, connectionId: String) {
+  def close(selector: KSelector, connectionId: String): Unit = {
     val channel = selector.channel(connectionId)
     if (channel != null) {
       debug(s"Closing selector connection $connectionId")
@@ -218,7 +226,7 @@ private[kafka] abstract class AbstractServerThread(connectionQuotas: ConnectionQ
   /**
    * Close `channel` and decrement the connection count.
    */
-  def close(channel: SocketChannel) {
+  def close(channel: SocketChannel): Unit = {
     if (channel != null) {
       debug("Closing connection from " + channel.socket.getRemoteSocketAddress())
       connectionQuotas.dec(channel.socket.getInetAddress)
@@ -389,7 +397,7 @@ private[kafka] class Processor(val id: Int,
   newGauge("IdlePercent",
     new Gauge[Double] {
       def value = {
-        metrics.metrics().get(metrics.metricName("io-wait-ratio", "socket-server-metrics", metricTags)).value()
+        Option(metrics.metric(metrics.metricName("io-wait-ratio", "socket-server-metrics", metricTags))).fold(0.0)(_.value)
       }
     },
     metricTags.asScala
@@ -443,7 +451,9 @@ private[kafka] class Processor(val id: Int,
             // that are sitting in the server's socket buffer
             curr.request.updateRequestMetrics
             trace("Socket server received empty response to send, registering for read: " + curr)
-            selector.unmute(curr.request.connectionId)
+            val channelId = curr.request.connectionId
+            if (selector.channel(channelId) != null || selector.closingChannel(channelId) != null)
+                selector.unmute(channelId)
           case RequestChannel.SendAction =>
             sendResponse(curr)
           case RequestChannel.CloseConnectionAction =>
@@ -486,9 +496,12 @@ private[kafka] class Processor(val id: Int,
   private def processCompletedReceives() {
     selector.completedReceives.asScala.foreach { receive =>
       try {
-        val channel = selector.channel(receive.source)
-        val session = RequestChannel.Session(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, channel.principal.getName),
-          channel.socketAddress)
+        val openChannel = selector.channel(receive.source)
+        val session = {
+          // Only methods that are safe to call on a disconnected channel should be invoked on 'channel'.
+          val channel = if (openChannel != null) openChannel else selector.closingChannel(receive.source)
+          RequestChannel.Session(new KafkaPrincipal(KafkaPrincipal.USER_TYPE, channel.principal.getName), channel.socketAddress)
+        }
         val req = RequestChannel.Request(processor = id, connectionId = receive.source, session = session, buffer = receive.payload, startTimeMs = time.milliseconds, securityProtocol = protocol)
         requestChannel.sendRequest(req)
         selector.mute(receive.source)
